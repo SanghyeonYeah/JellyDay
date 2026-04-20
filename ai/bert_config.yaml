@@ -1,0 +1,58 @@
+# BERT 의도 분류 하이퍼파라미터 설정
+
+# 모델 기본 설정
+model:
+  name: "klue/bert-base"
+  dropout: 0.3
+  max_len: 128
+  gradient_checkpointing: true
+
+# 학습 하이퍼파라미터
+training:
+  epochs: 10
+  weight_decay: 0.01
+  lr_bert: 2.0e-5        # BERT 인코더 레이어 학습률 (낮게 유지)
+  lr_head: 1.0e-4        # 분류 헤드 학습률 (높게 설정)
+  warmup_ratio: 0.1      # 전체 스텝 대비 warmup 비율
+
+# Focal Loss
+focal_loss:
+  gamma: 2.0             # 포커싱 강도. 0=CrossEntropy와 동일, 불균형 심할수록 높게
+
+  # alpha 모드 선택: "manual" 또는 "dynamic"
+  #   manual  -> 아래 alpha_manual 값을 그대로 사용
+  #   dynamic -> 데이터 분포에서 클래스별 샘플 수 역수로 자동 계산
+  alpha_mode: "dynamic"
+
+  # [manual 모드] 클래스 순서: normal(0) pain(1) distress(2) emergency(3) activity(4)
+  alpha_manual:
+    normal:    1.0
+    pain:      2.0
+    distress:  2.5
+    emergency: 3.0
+    activity:  1.2
+
+  # [dynamic 모드] 자동 계산 후 스케일 조정 옵션
+  dynamic_normalize: true   # true: 가중치 합이 N_CLASSES가 되도록 정규화
+  dynamic_scale: 1.0        # 전체 alpha에 곱하는 추가 배율 (기본 1.0)
+
+# 위험도 점수 가중치
+# intent_risk_score = pain*w_pain + distress*w_distress + emergency*w_emergency
+risk_weights:
+  pain:      0.6
+  distress:  0.8
+  emergency: 1.0
+
+# IntentRouter 임계값
+router:
+  threshold: 0.5           # 이 확률 이상 + normal/activity -> lstm 라우팅
+
+# YamNet 연동 임계값
+yamnet:
+  conf_threshold: 0.6      # 이 확률 이상일 때만 BERT 라우터 호출
+  trigger_events:
+    - "Groan"
+    - "Shout"
+    - "Crying"
+    - "Screaming"
+    - "Wheezing"
