@@ -449,7 +449,8 @@ class FinalRiskPipeline:
             drug_risk_score          = drug_result.get('drug_risk_score', 0.0),
             n_drugs                  = min(n_drugs / 10.0, 1.0),
             has_major_interaction    = float(any(
-                i['severity'] in ('major','serious')
+                # 'contraindicated' = 식약처 DUR 병용금기(최고 위험), 'major' = DDInter Major 등급
+                i['severity'] in ('contraindicated', 'major')
                 for i in drug_result.get('interactions', [])
             )),
             anomaly_composite = float(np.mean([

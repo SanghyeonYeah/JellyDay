@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 import pandas as pd
 import yaml

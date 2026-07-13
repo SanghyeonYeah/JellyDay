@@ -3,13 +3,14 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 from filterpy.kalman import KalmanFilter
 from scipy.io import arff
-from collections import deque
+from collections import deque, defaultdict
 from datetime import datetime, timedelta
+import re
 import sqlite3
 import json
 
@@ -229,7 +230,8 @@ class ZoneClusterer:
 
     def refit(self, rssi_recent: np.ndarray, timestamps_recent: pd.Series):
         print(f"[ZoneClusterer] Refit #{self.refit_count + 1} 시작")
-        old_centers = dict(self.cluster_centers)
+        old_centers  = dict(self.cluster_centers)
+        old_zone_map = dict(self.zone_map)   # 이전 구역 이름(예: 'zone_2_bedroom') 승계용
         self.dbscan          = DBSCAN(eps=self.eps, min_samples=self.min_samples)
         self.scaler          = StandardScaler()
         self.zone_map        = {}
@@ -243,12 +245,9 @@ class ZoneClusterer:
                     d = np.linalg.norm(new_center - old_center)
                     if d < best_dist:
                         best_dist, best_old = d, old_lab
-                if best_dist < self.drift_threshold * 2:
-                    old_name = f'zone_{best_old}_'
-                    matched  = next((v for k, v in self.zone_map.items()
-                                     if k == new_lab), None)
-                    if matched and old_name not in matched:
-                        self.zone_map[new_lab] = matched
+                # drift_threshold*2 이내로 가까우면 이전 구역 이름을 그대로 승계 (이름 연속성 유지)
+                if best_dist < self.drift_threshold * 2 and best_old in old_zone_map:
+                    self.zone_map[new_lab] = old_zone_map[best_old]
 
         self.refit_count += 1
         self.refit_needed = False
@@ -327,7 +326,10 @@ class PatternLSTM(nn.Module):
 
 class ZoneDataset(Dataset):
     def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float16)
+        # float32로 저장 -> 배치 단위로 amp_dtype()(bf16/fp16)으로 변환해 사용.
+        # 여기서 float16으로 고정하면 gpu_config가 Ampere에서 고르는 bf16 대신
+        # fp16 왕복 변환이 끼어들어 정밀도를 불필요하게 낮춘다.
+        self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
 
     def __len__(self): return len(self.X)
@@ -561,7 +563,8 @@ class PatternAnomalyDetector:
                  baseline_window: int   = 200,
                  k_base         : float = 2.0,
                  k_var          : float = 1.5,
-                 history_db_path: str   = 'anomaly_history.db'):
+                 history_db_path: str   = 'anomaly_history.db',
+                 trans_mat      : 'ZoneTransitionMatrix | None' = None):
 
         self.model            = model
         self.device           = device
@@ -569,6 +572,7 @@ class PatternAnomalyDetector:
         self.baseline_window  = baseline_window
         self.k_base           = k_base
         self.k_var            = k_var
+        self.trans_mat        = trans_mat   # zone_transition_abnormal 계산용 (04_xgboost_risk.py 연동)
 
         self._baseline_buf: list = []
         self.baseline_mean : float | None = None
@@ -576,6 +580,16 @@ class PatternAnomalyDetector:
         self._recent  = deque(maxlen=50)
         self.history  = deque(maxlen=100)
         self.db       = AnomalyHistoryDB(history_db_path)
+
+        # 구역 체류시간(dwell time) 추적 -> time_in_unusual_zone 계산용
+        self._current_zone_id : int | None = None
+        self._zone_entry_time : datetime | None = None
+        self._zone_dwell_hist : dict = defaultdict(list)   # zone_id -> 과거 체류시간(분) 리스트
+        self._prev_zone_id    : int | None = None
+
+    def set_transition_matrix(self, trans_mat: 'ZoneTransitionMatrix'):
+        """학습된 ZoneTransitionMatrix(zone_transition.npy)를 로드 후 연결."""
+        self.trans_mat = trans_mat
 
     # 동적 임계값
     def _compute_threshold(self) -> float:
@@ -594,6 +608,22 @@ class PatternAnomalyDetector:
     @property
     def threshold(self) -> float:
         return self._compute_threshold()
+
+    # 구역 문자열('zone_3_bedroom') -> 클러스터 인덱스(3)
+    @staticmethod
+    def _zone_to_id(zone) -> int:
+        """
+        predict_zone()은 'zone_3_bedroom' 형태의 문자열을 반환하는데,
+        모델 확률 텐서(probs[zone_id])를 인덱싱하려면 정수 인덱스가 필요하다.
+        'unknown' 등 파싱 불가 값은 0으로 폴백.
+        """
+        if isinstance(zone, int):
+            return zone
+        if isinstance(zone, str):
+            m = re.match(r'zone_(\d+)_', zone)
+            if m:
+                return int(m.group(1))
+        return 0
 
     # 시간대 가중치 적용 점수
     @staticmethod
@@ -622,15 +652,61 @@ class PatternAnomalyDetector:
             return 'yellow'
         return 'none'
 
+    # 구역 전이 이상도: 직전 구역 -> 현재 구역 전이가 학습된 패턴에서 얼마나 드문지
+    def _zone_transition_abnormal(self, zone_id: int) -> float:
+        """
+        ZoneTransitionMatrix.transition_prob(prev_zone)에서 현재 zone_id로의 확률을 조회해
+        1 - prob 로 반환 (확률이 낮은, 즉 드문 전이일수록 1.0에 가까움).
+        trans_mat 미연결이거나 첫 호출(prev_zone 없음)이면 0.0.
+        """
+        if self.trans_mat is None or self._prev_zone_id is None:
+            return 0.0
+        probs = self.trans_mat.transition_prob(self._prev_zone_id)
+        if zone_id < 0 or zone_id >= len(probs):
+            return 1.0
+        return float(1.0 - probs[zone_id])
+
+    # 구역 체류시간 이상도: 현재 구역에 평소보다 비정상적으로 오래/짧게 머무는지
+    def _time_in_unusual_zone(self, zone_id: int, now: datetime) -> float:
+        """
+        구역이 바뀔 때마다 직전 구역의 체류시간(분)을 해당 구역 이력에 기록하고,
+        현재 구역에서의 누적 체류시간이 그 구역의 과거 평균 대비 몇 표준편차(z-score)
+        벗어났는지를 0~1로 정규화해 반환 (z>=3 -> 1.0).
+        이력이 5개 미만인 구역(신뢰 불가)은 0.0.
+        """
+        if self._current_zone_id != zone_id:
+            if self._current_zone_id is not None and self._zone_entry_time is not None:
+                dwell_min = (now - self._zone_entry_time).total_seconds() / 60.0
+                hist = self._zone_dwell_hist[self._current_zone_id]
+                hist.append(dwell_min)
+                if len(hist) > 200:
+                    hist.pop(0)
+            self._current_zone_id = zone_id
+            self._zone_entry_time = now
+            return 0.0   # 방금 진입한 구역은 아직 이상 판단 불가
+
+        hist = self._zone_dwell_hist.get(zone_id, [])
+        if len(hist) < 5:
+            return 0.0
+
+        dwell_now   = (now - self._zone_entry_time).total_seconds() / 60.0
+        mean, std   = float(np.mean(hist)), float(np.std(hist)) or 1.0
+        z           = abs(dwell_now - mean) / std
+        return float(np.clip(z / 3.0, 0.0, 1.0))
+
     # 이상치 점수 계산
     def score(self, seq: torch.Tensor, actual_zone: str | int,
               hour: int | None = None) -> dict:
         """
         반환 dict:
-            raw_score     : 모델 예측 기반 원시 점수
-            weighted_score: 시간대 가중치 적용 점수
-            alert_level   : 'none' | 'yellow' | 'red'
-            threshold     : 당시 동적 임계값
+            raw_score               : 모델 예측 기반 원시 점수
+            weighted_score          : 시간대 가중치 적용 점수 (= anomaly_score)
+            alert_level             : 'none' | 'yellow' | 'red'
+            threshold                : 당시 동적 임계값
+            anomaly_score            : 04_xgboost_risk.py RiskFeatures 연동용 (weighted_score와 동일)
+            variability               : 최근 점수 변동성 (04 연동용)
+            zone_transition_abnormal : 직전 구역 -> 현재 구역 전이 이상도 (04 연동용)
+            time_in_unusual_zone     : 현재 구역 체류시간 이상도 (04 연동용)
         """
         self.model.eval()
         with torch.no_grad(), autocast(device_type='cuda', dtype=amp_dtype()):
@@ -638,7 +714,7 @@ class PatternAnomalyDetector:
                 self.model(seq.unsqueeze(0).to(self.device).to(amp_dtype())), dim=-1
             )[0]
 
-        zone_id = actual_zone if isinstance(actual_zone, int) else 0
+        zone_id = self._zone_to_id(actual_zone)
         raw     = 1.0 - probs[zone_id].item()
 
         # 시간대 가중치 적용
@@ -663,6 +739,12 @@ class PatternAnomalyDetector:
         is_anomaly  = alert != 'none'
         zone_str    = actual_zone if isinstance(actual_zone, str) else str(actual_zone)
 
+        # 구역 전이/체류시간 이상도 (04_xgboost_risk.py 연동 피처)
+        now             = datetime.now()
+        trans_abnormal  = self._zone_transition_abnormal(zone_id)
+        dwell_abnormal  = self._time_in_unusual_zone(zone_id, now)
+        self._prev_zone_id = zone_id
+
         self.db.record(
             anomaly_score = raw,
             actual_zone   = zone_str,
@@ -673,10 +755,15 @@ class PatternAnomalyDetector:
         )
 
         return {
-            'raw_score'     : raw,
-            'weighted_score': weighted,
-            'alert_level'   : alert,
-            'threshold'     : thr,
+            'raw_score'               : raw,
+            'weighted_score'          : weighted,
+            'alert_level'             : alert,
+            'threshold'               : thr,
+            # 04_xgboost_risk.py의 FinalRiskPipeline.compute()가 기대하는 키
+            'anomaly_score'           : weighted,
+            'variability'             : self.variability_score(),
+            'zone_transition_abnormal': trans_abnormal,
+            'time_in_unusual_zone'    : dwell_abnormal,
         }
 
     def should_ask_user(self, result: dict) -> bool:
@@ -709,7 +796,7 @@ class PatternAnomalyDetector:
         self.model.train()
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type='cuda', dtype=amp_dtype()):
-            zone_id = zone if isinstance(zone, int) else 0
+            zone_id = self._zone_to_id(zone)
             loss = nn.CrossEntropyLoss()(
                 self.model(seq.unsqueeze(0).to(self.device).to(amp_dtype())),
                 torch.tensor([zone_id], device=self.device),
@@ -787,6 +874,13 @@ def train_lstm(arff_path: str, rssi_cols: list, accel_cols: list,
     clusterer   = ZoneClusterer()
     zone_labels = clusterer.fit(rssi_f, ts)
     clusterer.save('zone_clusterer.json')
+
+    # DBSCAN이 실제로 찾은 구역 수가 n_zones(기본 10)보다 많으면 확장.
+    # 그대로 두면 one-hot/전이행렬 밖의 라벨이 생겨 CrossEntropyLoss가
+    # target out-of-bounds로 죽거나(라벨 >= n_zones) 조용히 all-zero 피처가 된다.
+    if len(zone_labels) > 0 and zone_labels.max() >= n_zones:
+        n_zones = int(zone_labels.max()) + 1
+        print(f"[train_lstm] DBSCAN이 {n_zones}개 구역 발견 -> n_zones 확장")
 
     # 상태 전이 행렬 학습
     trans_mat = ZoneTransitionMatrix(n_zones)
